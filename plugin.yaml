@@ -1,0 +1,5 @@
+name: jev-prose-features
+version: "1.5.0"
+description: "On-demand advisory Jev classification of prose features for reader naturalness; never rewrites or gates text."
+provides_tools:
+  - jev_classify_prose_features

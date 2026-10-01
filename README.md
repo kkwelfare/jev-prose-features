@@ -11,6 +11,10 @@ An on-demand, advisory Hermes plugin for examining how Japanese prose reads to i
 - `sentence_context.py` is offline only. It prepares stable sentence targets, whole-document previous/next context, global Python code-point spans, and up to 48 targets (12 sequential batches of at most four). It does not infer heading exclusions or call a provider; over-cap inputs raise rather than truncate.
 - Explicit segment `previous_sentence` / `next_sentence` values are context only, never extra targets. Input limits and two-call cap are validated before sending. No automatic retry or fallback is performed.
 
+## Lifecycle logging
+
+The registered tool emits metadata-only `jev.lifecycle` INFO events for provider attempts, validation, and tool-result delivery. Request text and credentials are not logged; logging failures preserve the original advisory result.
+
 ## Use
 
 Install this directory with the Hermes plugin manager and explicitly enable the plugin/tool in the intended profile. No credential or gateway setup is performed by this package. A docs proofreading flow can run its deterministic local filter first, then use `sentence_context.prepare_segments(...)` to prepare bounded advisory requests. The helper never sends text.

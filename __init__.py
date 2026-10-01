@@ -9,6 +9,29 @@ import importlib.util
 import json
 import os
 import sys
+import logging
+import uuid
+
+_log = logging.getLogger("hermes_plugins.jev_lifecycle.prose")
+_log.setLevel(logging.INFO)
+if not any(getattr(h, "_jev_lifecycle_console", False) for h in _log.handlers):
+    _console = logging.StreamHandler()
+    _console.setLevel(logging.INFO)
+    _console.setFormatter(logging.Formatter("%(message)s"))
+    setattr(_console, "_jev_lifecycle_console", True)
+    _log.addHandler(_console)
+
+def _lifecycle(event, request_id, **fields):
+    try:
+        import re
+        safe = {k: v for k, v in fields.items() if k in {"provider", "attempt", "status", "failure", "destination"}}
+        for key, value in list(safe.items()):
+            if isinstance(value, str): safe[key] = re.sub(r"[^A-Za-z0-9_.:+-]", "_", value)[:96]
+        clean_id = re.sub(r"[^A-Za-z0-9_.:+-]", "_", str(request_id))[:80]
+        _log.info("jev.lifecycle event=%s route=jev.docs.prose request_id=%s metadata=%s", event, clean_id, json.dumps(safe, sort_keys=True))
+    except Exception:
+        pass
+
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -174,6 +197,7 @@ class ProseFeatureTool:
         except _core.InputError as exc:
             return json.dumps({"status": "unknown", "reason": str(exc), "taxonomy_version": _core.TAXONOMY_VERSION,
                                "advisory_only": True, "segments": []}, ensure_ascii=False)
+        request_id = None
         try:
             primary, timeout = _provider_config(self.ctx)
             if primary["name"] not in {"typesafe", "openrouter"}:
@@ -183,14 +207,22 @@ class ProseFeatureTool:
             # Calls are sequential, capped at two total, and never retried/fallbacked.
             merged = {"model": "unknown", "features": {}}
             groups = [clean["segments"][i:i + 4] for i in range(0, len(clean["segments"]), 4)]
-            for group in groups:
+            for attempt, group in enumerate(groups, 1):
                 batch = {**clean, "segments": group}
                 request = _core.build_request(batch, model=primary["model"])
                 question_map = request.pop("_question_map")
-                raw_response = _send(self.ctx, None, request, timeout)
+                request_id = "jev-prose-" + uuid.uuid4().hex[:20]
+                _lifecycle("provider_start", request_id, provider=primary["name"], attempt=attempt)
+                try:
+                    raw_response = _send(self.ctx, None, request, timeout)
+                    _lifecycle("transport_response", request_id, provider=primary["name"], attempt=attempt, status="returned")
+                except Exception as error:
+                    _lifecycle("provider_failure", request_id, provider=primary["name"], attempt=attempt, failure=type(error).__name__)
+                    raise
                 parsed = _core.parse_response(raw_response)
                 request["_question_map"] = question_map
                 validated = _core.validate_response(batch, request, parsed)
+                _lifecycle("validated_response", request_id, status="valid")
                 merged["model"] = validated["model"]
                 merged["features"].update(validated["features"])
             result = _core.bind_response(clean, merged)
@@ -202,7 +234,10 @@ class ProseFeatureTool:
                 safe_reason = ""
             reason = getattr(exc, "reason", None) or (str(exc) if isinstance(exc, _core.InputError) else safe_reason or "provider_unavailable")
             result = _core.unknown_result(clean, reason)
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
+        output = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        if request_id is not None:
+            _lifecycle("delivered", request_id, destination="jev_classify_prose_features_tool_result", status=result.get("status", "unknown"))
+        return output
 
 
 def register(ctx):

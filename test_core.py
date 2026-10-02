@@ -452,3 +452,40 @@ class CoreTests(unittest.TestCase):
   self.assertEqual(bound["segments"][1]["review_status"],"assessed")
   self.assertEqual(bound["segments"][1]["review_candidates"],[])
   self.assertIsNone(bound["segments"][1]["review_confidence"])
+
+ def test_protected_segments_do_not_consume_two_provider_batches(self):
+  protected=[{"id":f"protected-{i}","text":"`code only`"} for i in range(4)]
+  body={"id":"body-0","text":"Readable prose."}
+  calls=[]
+  def fake_send(_ctx,_bridge,request,_timeout):
+   calls.append(request)
+   state=json.loads(request["state"])
+   batch=core.prepare_input({"segments":state["segments"]})
+   fixture=core.build_request(batch,model="offline-fixture")
+   answers={}
+   for key,(_sid,_feature,labels) in fixture["_question_map"].items():
+    choice=labels[0]
+    answers[key]={"choice":choice,"confidence":0.9,"probabilities":{label:(1.0 if label==choice else 0.0) for label in labels}}
+   return {"model":"offline-fixture","answers":answers}
+  for segments in (protected+[body],[body]+protected):
+   calls.clear()
+   with patch.object(plugin,"_send",side_effect=fake_send):
+    result=json.loads(plugin.ProseFeatureTool(Context())({"segments":segments}))
+   self.assertEqual(result["status"],"classified")
+   self.assertEqual(len(calls),1)
+   self.assertEqual([len(json.loads(call["state"])["segments"]) for call in calls],[1])
+   rows={row["id"]:row for row in result["segments"]}
+   self.assertEqual([row["id"] for row in result["segments"]],[row["id"] for row in segments])
+   self.assertTrue(all(rows[f"protected-{i}"]["features"]["japanese_naturalness"]["label"]=="unassessed" for i in range(4)))
+   self.assertNotEqual(rows["body-0"]["features"]["japanese_naturalness"]["label"],"unassessed")
+
+ def test_all_protected_segments_remain_unknown_without_provider_calls(self):
+  segments=[{"id":f"protected-{i}","text":"`code only`"} for i in range(4)]
+  with patch.object(plugin,"_send") as send:
+   result=json.loads(plugin.ProseFeatureTool(Context())({"segments":segments}))
+  self.assertEqual(result["status"],"unknown")
+  self.assertEqual(result["reason"],"no_unprotected_prose")
+  self.assertEqual(len(result["segments"]),4)
+  self.assertTrue(all(row["review_status"]=="unassessed" for row in result["segments"]))
+  self.assertTrue(all(row["features"]["japanese_naturalness"]["label"]=="unassessed" for row in result["segments"]))
+  send.assert_not_called()

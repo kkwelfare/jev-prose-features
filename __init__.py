@@ -202,11 +202,13 @@ class ProseFeatureTool:
             primary, timeout = _provider_config(self.ctx)
             if primary["name"] not in {"typesafe", "openrouter"}:
                 raise _core.InputError("unsupported_provider")
-            if len(clean["segments"]) > 8:
-                raise _core.InputError("too_many_segments_for_two_calls")
             # Calls are sequential, capped at two total, and never retried/fallbacked.
             merged = {"model": "unknown", "features": {}}
-            groups = [clean["segments"][i:i + 4] for i in range(0, len(clean["segments"]), 4)]
+            protected = [row for row in clean["segments"] if not row["classification_text"].strip()]
+            eligible = [row for row in clean["segments"] if row["classification_text"].strip()]
+            if not eligible:
+                raise _core.InputError("no_unprotected_prose")
+            groups = [eligible[i:i + 4] for i in range(0, len(eligible), 4)]
             for attempt, group in enumerate(groups, 1):
                 batch = {**clean, "segments": group}
                 request = _core.build_request(batch, model=primary["model"])
@@ -225,6 +227,8 @@ class ProseFeatureTool:
                 _lifecycle("validated_response", request_id, status="valid")
                 merged["model"] = validated["model"]
                 merged["features"].update(validated["features"])
+            for row in protected:
+                merged["features"][row["id"]] = {}
             result = _core.bind_response(clean, merged)
         except Exception as exc:
             # Error details and provider payloads are intentionally excluded.

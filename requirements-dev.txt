@@ -1,0 +1,2 @@
+# Test-only dependencies for the public offline suite.
+pytest>=7

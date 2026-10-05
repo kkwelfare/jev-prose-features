@@ -28,8 +28,9 @@ printf '%s\n' '{"segments":[{"id":"synthetic-1","text":"確認します。","pre
 ## Verify
 
 ```sh
-python3 -m unittest -v test_core.py test_sentence_context.py
+python3 -m pip install -r requirements-dev.txt
+python3 scripts/run_tests.py
 hermes plugins validate . --json
 ```
 
-The tests use mocks and synthetic strings. They do not demonstrate real-provider classification accuracy or make a billable provider call. This public source package excludes task-specific article samples, private sentence maps, scratch drivers, and backups. The README reflects the optional bounded docs-proofreading workflow; callers must preserve the full document and report uncovered scope rather than silently truncating it.
+`requirements-dev.txt` supplies the test runner (`pytest`) and runtime dependencies needed by the offline suite. `scripts/run_tests.py` runs core, sentence-context, and lifecycle tests under unittest, then collects the lifecycle pytest cases; it returns nonzero immediately if either suite fails. Both use mocks and synthetic strings and do not demonstrate real-provider classification accuracy or make a billable provider call. This public source package excludes task-specific article samples, private sentence maps, scratch drivers, and backups. The README reflects the optional bounded docs-proofreading workflow; callers must preserve the full document and report uncovered scope rather than silently truncating it.

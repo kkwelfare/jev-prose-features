@@ -23,12 +23,8 @@ if not any(getattr(h, "_jev_lifecycle_console", False) for h in _log.handlers):
 
 def _lifecycle(event, request_id, **fields):
     try:
-        import re
-        safe = {k: v for k, v in fields.items() if k in {"provider", "attempt", "status", "failure", "destination"}}
-        for key, value in list(safe.items()):
-            if isinstance(value, str): safe[key] = re.sub(r"[^A-Za-z0-9_.:+-]", "_", value)[:96]
-        clean_id = re.sub(r"[^A-Za-z0-9_.:+-]", "_", str(request_id))[:80]
-        _log.info("jev.lifecycle event=%s route=jev.docs.prose request_id=%s metadata=%s", event, clean_id, json.dumps(safe, sort_keys=True))
+        safe = {k: v for k, v in fields.items() if k in {"provider", "attempt", "status", "failure", "destination", "fallback_used", "reason_class"}}
+        _log.info("jev.lifecycle event=%s route=jev.docs.prose request_id=%s metadata=%s", event, request_id, json.dumps(safe, sort_keys=True))
     except Exception:
         pass
 
@@ -50,7 +46,7 @@ def _schema() -> dict:
     return {
         "name": "jev_classify_prose_features",
         "description": (
-            "Classify whether supplied prose reads naturally to its intended reader in context. Returns the original eight advisory feature labels and confidence unchanged, plus per-segment review_candidates at the provisional 0.5 threshold. Candidates are review topics, not deletion or rewrite suggestions; author_style_impression alone never creates one. No text is rewritten, corrected, submitted, or blocked. Avoid private/sensitive text."
+            "Classify supplied prose in context across ten independent advisory axes, including a purpose/context-to-sentence focus shift and a separate action/effect-substitution signal. Returns source-bound labels and confidence plus per-segment review_candidates at the provisional 0.5 threshold. Candidates are review topics, not deletion or rewrite suggestions; each new axis creates a candidate only when present at confidence >= 0.5; author_style_impression never creates one. No text is rewritten, corrected, submitted, or blocked. Avoid private/sensitive text."
         ),
         "parameters": {
             "type": "object",
@@ -75,33 +71,83 @@ def _schema() -> dict:
 
 
 def _runtime_key(env_name):
-    value = os.environ.get(env_name, "")
-    if value.strip(): return value.strip()
-    hermes_home = os.environ.get("HERMES_HOME", "")
+    """Resolve credentials through Hermes' active profile scope when available.
+
+    A scoped miss is final: falling through to process globals or another profile's
+    dotenv would defeat Hermes' multiplex isolation. The env/dotenv path below is
+    deliberately limited to standalone hosts that do not provide the secret API.
+    """
     try:
-        from hermes_cli.env_loader import load_hermes_dotenv
-        load_hermes_dotenv(hermes_home=hermes_home or None)
-    except Exception:
-        # Standalone/test hosts may not ship the Hermes helper. Read only the
-        # requested key from the standard dotenv path; never log its contents.
-        candidates = [Path(hermes_home) / ".env"] if hermes_home else []
-        if hermes_home and Path(hermes_home).parent.name == "profiles":
-            candidates.append(Path(hermes_home).parent.parent / ".env")
-        for path in candidates:
+        from agent.secret_scope import UnscopedSecretError, get_secret_str
+    except ImportError:
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+        except ImportError:
+            load_hermes_dotenv = None
+        if load_hermes_dotenv is not None:
             try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith("export "): line = line[7:].lstrip()
-                    if not line or line.startswith("#") or "=" not in line: continue
-                    name, candidate = line.split("=", 1)
-                    if name.strip() != env_name: continue
-                    candidate = candidate.strip()
-                    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "\"'":
-                        candidate = candidate[1:-1]
-                    if candidate.strip(): return candidate.strip()
-            except OSError:
-                continue
-    return os.environ.get(env_name, "").strip()
+                from agent.secret_scope import UnscopedSecretError, get_secret_str
+            except ImportError:
+                # Hermes runtime without the scoped resolver: no profile-safe lookup exists.
+                return ""
+        else:
+            # Truly standalone host: retain the prior minimal env/dotenv compatibility.
+            value = os.environ.get(env_name, "")
+            if value.strip():
+                return value.strip()
+            hermes_home = os.environ.get("HERMES_HOME", "")
+            try:
+                load_hermes_dotenv = None
+            except Exception:
+                load_hermes_dotenv = None
+            candidates = [Path(hermes_home) / ".env"] if hermes_home else []
+            if hermes_home and Path(hermes_home).parent.name == "profiles":
+                candidates.append(Path(hermes_home).parent.parent / ".env")
+            for path in candidates:
+                try:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line.startswith("export "): line = line[7:].lstrip()
+                        if not line or line.startswith("#") or "=" not in line: continue
+                        name, candidate = line.split("=", 1)
+                        if name.strip() != env_name: continue
+                        candidate = candidate.strip()
+                        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "\"'":
+                            candidate = candidate[1:-1]
+                        if candidate.strip(): return candidate.strip()
+                except OSError:
+                    continue
+            return os.environ.get(env_name, "").strip()
+        hermes_home = os.environ.get("HERMES_HOME", "")
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+            load_hermes_dotenv(hermes_home=hermes_home or None)
+        except Exception:
+            # Read only the requested key from conventional dotenv paths; never log it.
+            candidates = [Path(hermes_home) / ".env"] if hermes_home else []
+            if hermes_home and Path(hermes_home).parent.name == "profiles":
+                candidates.append(Path(hermes_home).parent.parent / ".env")
+            for path in candidates:
+                try:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line.startswith("export "): line = line[7:].lstrip()
+                        if not line or line.startswith("#") or "=" not in line: continue
+                        name, candidate = line.split("=", 1)
+                        if name.strip() != env_name: continue
+                        candidate = candidate.strip()
+                        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "\"'":
+                            candidate = candidate[1:-1]
+                        if candidate.strip(): return candidate.strip()
+                except OSError:
+                    continue
+        return os.environ.get(env_name, "").strip()
+
+    try:
+        return (get_secret_str(env_name, "") or "").strip()
+    except UnscopedSecretError:
+        # Do not bypass an absent/misbound profile scope via os.environ or .env.
+        return ""
 
 
 def _provider_config(ctx):
@@ -145,6 +191,28 @@ def _provider_config(ctx):
     return spec, max(0.5, timeout)
 
 
+def _fallback_config(ctx):
+    """Return the fixed OpenRouter fallback, independent of primary route settings."""
+    get = getattr(ctx, "get_config", lambda _k, d=None: d)
+    defaults = {
+        "name": "openrouter",
+        "endpoint": "https://openrouter.ai/api/alpha/decisions",
+        "model": "typesafe/jev-1.13",
+        "env": "OPENROUTER_API_KEY",
+    }
+    keys = {"endpoint": "fallback_endpoint", "model": "fallback_model", "env": "fallback_api_key_env"}
+    spec = dict(defaults)
+    for field, key in keys.items():
+        try:
+            value = get(key, None)
+        except Exception:
+            value = None
+        # Never inherit a primary setting as a fallback default.
+        if value:
+            spec[field] = str(value)
+    return spec
+
+
 def _post_systemone(spec, body, timeout):
     key = _runtime_key(spec["env"])
     if not key: raise RuntimeError("credential_unavailable")
@@ -181,11 +249,34 @@ def _post_openrouter(spec, body, timeout):
     except (UnicodeDecodeError, json.JSONDecodeError): raise RuntimeError("malformed_response") from None
 
 
-def _send(ctx, bridge, body, timeout):
-    primary, timeout = _provider_config(ctx)
+def _send(ctx, bridge, body, timeout, _provider_spec=None):
+    if _provider_spec is None:
+        primary, timeout = _provider_config(ctx)
+    else:
+        primary = _provider_spec
     if primary["name"] == "typesafe": return _post_systemone(primary, body, timeout)
     if primary["name"] == "openrouter": return _post_openrouter(primary, body, timeout)
     raise RuntimeError("unsupported_provider")
+
+
+def _send_with_fallback(ctx, request_id, primary_body, primary_map, fallback_body, fallback_map, timeout):
+    """Retry once on the independent fallback only for transport/auth failures."""
+    try:
+        primary, _ = _provider_config(ctx)
+        return _send(ctx, None, primary_body, timeout, primary), primary_map, primary["name"], False, ""
+    except RuntimeError as exc:
+        reason = str(exc)
+        if not (reason in {"credential_unavailable", "network_error"}
+                or reason.startswith("http_error_") and reason[11:].isdigit()):
+            raise
+    fallback = _fallback_config(ctx)
+    primary, _ = _provider_config(ctx)
+    if fallback["name"] != "openrouter" or primary["name"] == fallback["name"]:
+        raise RuntimeError("unsupported_fallback_provider")
+    fallback_timeout = timeout
+    _lifecycle("provider_start", request_id, provider=fallback["name"], attempt=2, reason_class=reason)
+    response = _send(ctx, None, fallback_body, fallback_timeout, fallback)
+    return response, fallback_map, fallback["name"], True, reason
 
 class ProseFeatureTool:
     def __init__(self, ctx):
@@ -213,11 +304,17 @@ class ProseFeatureTool:
                 batch = {**clean, "segments": group}
                 request = _core.build_request(batch, model=primary["model"])
                 question_map = request.pop("_question_map")
+                fallback = _fallback_config(self.ctx)
+                fallback_request = _core.build_request(batch, model=fallback["model"])
+                fallback_question_map = fallback_request.pop("_question_map")
                 request_id = "jev-prose-" + uuid.uuid4().hex[:20]
                 _lifecycle("provider_start", request_id, provider=primary["name"], attempt=attempt)
                 try:
-                    raw_response = _send(self.ctx, None, request, timeout)
-                    _lifecycle("transport_response", request_id, provider=primary["name"], attempt=attempt, status="returned")
+                    raw_response, question_map, actual_provider, fallback_used, fallback_reason = _send_with_fallback(
+                        self.ctx, request_id, request, question_map, fallback_request, fallback_question_map, timeout)
+                    _lifecycle("transport_response", request_id, provider=actual_provider,
+                               attempt=attempt if not fallback_used else 2, status="returned",
+                               fallback_used=fallback_used, reason_class=fallback_reason)
                 except Exception as error:
                     _lifecycle("provider_failure", request_id, provider=primary["name"], attempt=attempt, failure=type(error).__name__)
                     raise
@@ -250,7 +347,7 @@ def register(ctx):
         toolset="jev_prose_features",
         schema=_schema(),
         handler=ProseFeatureTool(ctx),
-        description="Reader-naturalness oriented, context-aware advisory classification; preserves all eight raw labels/confidence and emits confidence-filtered review topics, never rewrites or blocks.",
+        description="Context-aware advisory classification across ten independent prose axes; emits confidence-filtered review topics, never rewrites or blocks.",
     )
 
 

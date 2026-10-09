@@ -53,9 +53,9 @@ class CoreTests(unittest.TestCase):
   self.assertEqual(segment_schema["required"],["id","text"])
   rows=[{"id":f"s{i}","text":f"target-{i}","previous_sentence":f"prev-{i}","next_sentence":f"next-{i}"} for i in range(8)]
   sent=[]
-  def fake_send(ctx,bridge,body,timeout):
+  def fake_send(ctx,bridge,body,timeout,_provider_spec=None):
    sent.append(json.loads(body["state"]))
-   self.assertEqual(len(body["questions"]),8*len(sent[-1]["segments"]))
+   self.assertEqual(len(body["questions"]),10*len(sent[-1]["segments"]))
    style_questions=[q for q in body["questions"].values() if q["criteria"]=={"ai_like":"AIが書いた文に見える。","human_like":"人間が書いた文に見える。"}]
    self.assertEqual(len(style_questions),len(sent[-1]["segments"]))
    self.assertTrue(all("対象文と前後の文から、どちらの文体に見えるかを分類する。" in q["instructions"] for q in style_questions))
@@ -65,7 +65,7 @@ class CoreTests(unittest.TestCase):
     criteria=body["questions"][key]["criteria"]; choice=next(iter(criteria))
     answers[key]={"choice":choice,"confidence":0.9,"probabilities":{v:(1.0 if v==choice else 0.0) for v in criteria}}
    return {"model":"offline-fixture","answers":answers}
-  with patch.object(plugin,"_send",side_effect=fake_send):
+  with patch.object(plugin,"_send",side_effect=fake_send), patch.object(plugin,"_runtime_key",return_value="synthetic-test-key"):
    out=json.loads(plugin.ProseFeatureTool(Context())({"segments":rows,"reader":"就職準備中の人"}))
   self.assertEqual(out["status"],"classified"); self.assertEqual(len(sent),2)
   self.assertEqual([r["id"] for batch in sent for r in batch["segments"]],[r["id"] for r in rows])
@@ -140,7 +140,7 @@ class CoreTests(unittest.TestCase):
   with self.assertRaises(core.InputError): core.prepare_input({"segments":[{"id":"x","text":"a"},{"id":"x","text":"b"}]})
   row=core.prepare_input({"segments":[{"id":"s-1","text":"文字列"}]})["segments"][0]
   self.assertEqual((row["id"],row["start"],row["end"],row["offset_scope"]),("s-1",0,3,"segment_local"))
- def test_taxonomy_1_5_has_abstention_free_eight_axis_criteria_and_source_bound_choices(self):
+ def test_taxonomy_1_8_has_abstention_free_ten_axis_criteria_and_source_bound_choices(self):
   awkward="「何が気になっているかを、相談できる相手に話す」を選ぶ"
   natural="不安なことを相談できる相手に話してみる方法もあります"
   menu="治療法の一覧から、自分に合うものを選ぶ"
@@ -153,11 +153,20 @@ class CoreTests(unittest.TestCase):
   feature="japanese_naturalness"
   key=next(k for k,(_,f,_) in req["_question_map"].items() if f==feature)
   criteria=req["questions"][key]["criteria"]
-  self.assertEqual(core.TAXONOMY_VERSION,"jev-prose-features-1.5")
-  self.assertEqual(len(core.FEATURES),8)
+  self.assertEqual(core.TAXONOMY_VERSION,"jev-prose-features-1.8")
+  self.assertEqual(len(core.FEATURES),10)
   self.assertNotIn("formulaic_enumeration",core.FEATURES)
   self.assertNotIn("japanese_translationese",core.FEATURES)
-  self.assertEqual(set(core.FEATURES),{"empty_preamble_conclusion","abstract_action_unclear","redundant_paraphrase","unnecessary_contrast","excessive_praise_empathy","japanese_naturalness","scope_expression","author_style_impression"})
+  self.assertEqual(set(core.FEATURES),{"empty_preamble_conclusion","abstract_action_unclear","redundant_paraphrase","unnecessary_contrast","excessive_praise_empathy","japanese_naturalness","scope_expression","scope_boundary_blurring","action_effect_substitution","author_style_impression"})
+  self.assertIn("scope_boundary_blurring",core.BINARY_REVIEW_AXES)
+  self.assertIn("action_effect_substitution",core.BINARY_REVIEW_AXES)
+  self.assertEqual(set(core.FEATURE_CRITERIA["scope_boundary_blurring"]),{"present","absent"})
+  self.assertEqual(set(core.FEATURE_CRITERIA["action_effect_substitution"]),{"present","absent"})
+  boundary_q=next(q for q in req["questions"].values() if q["criteria"]==core.FEATURE_CRITERIA["scope_boundary_blurring"])
+  self.assertIn("abstract_action_unclear",req["questions"][next(k for k,(_,f,_) in req["_question_map"].items() if f=="abstract_action_unclear")]["instructions"])
+  self.assertIn("independent",boundary_q["instructions"])
+  self.assertIn("do not infer a historical replacement",boundary_q["instructions"])
+  self.assertIn("Do not propose rewrites or actions",boundary_q["instructions"])
   self.assertEqual(state["segments"],[{"id":"sentence-ja-17","text":row["classification_text"],"previous_sentence":"","next_sentence":""}])
   self.assertIn("何が気になっているかを、相談できる相手に話す",state["segments"][0]["text"])
   self.assertIn(natural,state["segments"][0]["text"])
@@ -352,8 +361,77 @@ class CoreTests(unittest.TestCase):
     if original_key is not None: os.environ["JEV_TEST_KEY_7F31"]=original_key
     if original_env is None: os.environ.pop("HERMES_HOME",None)
     else: os.environ["HERMES_HOME"]=original_env
+ def test_profile_secret_scope_precedes_environment_and_fails_closed_on_miss(self):
+  class Scope:
+   def __init__(self): self.values={"TYPESAFE_API_KEY":"docs-scoped-key"}; self.unscoped=False
+   def get_secret_str(self,name,default=""):
+    if self.unscoped: raise self.UnscopedSecretError(name)
+    return self.values.get(name,default)
+   class UnscopedSecretError(RuntimeError): pass
+  scope=Scope()
+  module=type("M",(),{"get_secret_str":scope.get_secret_str,"UnscopedSecretError":Scope.UnscopedSecretError})()
+  with patch.dict(sys.modules,{"agent.secret_scope":module}), patch.dict("os.environ",{"TYPESAFE_API_KEY":"ambient-other-profile-key","OPENROUTER_API_KEY":"ambient-openrouter-key"}):
+   self.assertEqual(plugin._runtime_key("TYPESAFE_API_KEY"),"docs-scoped-key")
+   self.assertEqual(plugin._runtime_key("OPENROUTER_API_KEY"),"")
+   scope.unscoped=True
+   self.assertEqual(plugin._runtime_key("TYPESAFE_API_KEY"),"")
+ def test_registered_handler_falls_back_when_primary_credential_is_missing(self):
+  cfg={"primary_provider":"typesafe","primary_endpoint":"https://api.typesafe.ai/v1/systemone","primary_model":"jev-latest","primary_api_key_env":"TYPESAFE_API_KEY","fallback_endpoint":"https://openrouter.ai/api/alpha/decisions","fallback_model":"typesafe/jev-1.13","fallback_api_key_env":"OPENROUTER_API_KEY"}
+  ctx=Context(cfg); plugin.register(ctx); handler=ctx.tools["jev_classify_prose_features"]["handler"]
+  sent=[]
+  def fake_send(ctx,bridge,body,timeout,_provider_spec=None):
+   spec=_provider_spec or plugin._provider_config(ctx)[0]
+   key=plugin._runtime_key(spec["env"])
+   if not key: raise RuntimeError("credential_unavailable")
+   sent.append((spec["name"],spec["endpoint"],body["model"],tuple(body["questions"])))
+   answers={}
+   for key,q in body["questions"].items():
+    choice=next(iter(q["criteria"]))
+    answers[key]={"choice":choice,"confidence":0.91,"probabilities":{label:(1.0 if label==choice else 0.0) for label in q["criteria"]}}
+   return {"model":"offline-openrouter","answers":answers}
+  with patch.object(plugin,"_runtime_key",side_effect=lambda name:"" if name=="TYPESAFE_API_KEY" else "synthetic-openrouter-key"), patch.object(plugin,"_send",side_effect=fake_send):
+   result=json.loads(handler({"segments":[{"id":"missing-key","text":"確認して対応します。"}]}))
+  self.assertEqual(result["status"],"classified")
+  self.assertEqual([row[:3] for row in sent],[("openrouter","https://openrouter.ai/api/alpha/decisions","typesafe/jev-1.13")])
+ def test_typesafe_fallback_transports_use_distinct_models_and_question_maps(self):
+  cfg={"primary_provider":"typesafe","primary_endpoint":"https://api.typesafe.ai/v1/systemone","primary_model":"jev-latest","primary_api_key_env":"TYPESAFE_API_KEY","fallback_endpoint":"https://openrouter.ai/api/alpha/decisions","fallback_model":"typesafe/jev-1.13","fallback_api_key_env":"OPENROUTER_API_KEY"}
+  sent=[]
+  def fake_post(spec,body,timeout):
+   state=json.loads(body["state"])
+   sent.append((spec["name"],spec["endpoint"],body["model"],state,[key for key in body["questions"]]))
+   if spec["name"]=="typesafe": raise RuntimeError("http_error_401")
+   answers={}
+   for key,q in body["questions"].items():
+    choice=next(iter(q["criteria"]))
+    answers[key]={"choice":choice,"confidence":0.91,"probabilities":{label:(1.0 if label==choice else 0.0) for label in q["criteria"]}}
+   return {"model":"offline-openrouter","answers":answers}
+  with patch.object(plugin,"_post_systemone",side_effect=fake_post), patch.object(plugin,"_post_openrouter",side_effect=fake_post), patch.object(plugin,"_runtime_key",return_value="synthetic-test-key"):
+   result=json.loads(plugin.ProseFeatureTool(Context(cfg))({"segments":[{"id":"fallback-ja","text":"確認して対応します。"}]}))
+  self.assertEqual(result["status"],"classified")
+  self.assertEqual([row[:3] for row in sent],[
+   ("typesafe","https://api.typesafe.ai/v1/systemone","jev-latest"),
+   ("openrouter","https://openrouter.ai/api/alpha/decisions","typesafe/jev-1.13"),
+  ])
+  self.assertEqual(sent[0][4],sent[1][4])
+  self.assertNotEqual(sent[0][2],sent[1][2])
+  self.assertEqual([entry["id"] for entry in sent[1][3]["segments"]],["fallback-ja"])
+ def test_success_does_not_fallback_and_parse_failure_does_not_fallback(self):
+  cfg={"primary_provider":"typesafe"}
+  clean=core.prepare_input({"segments":[{"id":"ok","text":"確認します。"}]})
+  request=core.build_request(clean,model="jev-latest")
+  answers={}
+  for key,q in request["questions"].items():
+   choice=next(iter(q["criteria"]))
+   answers[key]={"choice":choice,"confidence":0.91,"probabilities":{label:(1.0 if label==choice else 0.0) for label in q["criteria"]}}
+  calls=[]
+  with patch.object(plugin,"_post_systemone",side_effect=lambda spec,body,timeout:(calls.append(spec["name"]) or {"model":"offline-typesafe","answers":answers})), patch.object(plugin,"_post_openrouter",side_effect=AssertionError("unexpected fallback")), patch.object(plugin,"_runtime_key",return_value="synthetic-test-key"):
+   out=json.loads(plugin.ProseFeatureTool(Context(cfg))({"segments":[{"id":"ok","text":"確認します。"}]}))
+  self.assertEqual(out["status"],"classified"); self.assertEqual(calls,["typesafe"])
+  with patch.object(plugin,"_post_systemone",return_value={"malformed":"not answers"}), patch.object(plugin,"_post_openrouter",side_effect=AssertionError("parse failure must not fallback")), patch.object(plugin,"_runtime_key",return_value="synthetic-test-key"):
+   malformed=json.loads(plugin.ProseFeatureTool(Context(cfg))({"segments":[{"id":"bad","text":"確認します。"}]}))
+  self.assertEqual(malformed["status"],"unknown")
  def test_unavailable_route_returns_unknown(self):
-  with patch.object(plugin,"_send",side_effect=RuntimeError("credential_unavailable")):
+  with patch.object(plugin,"_send",side_effect=RuntimeError("credential_unavailable")), patch.object(plugin,"_post_openrouter",side_effect=RuntimeError("credential_unavailable")):
    out=json.loads(plugin.ProseFeatureTool(Context())({"segments":[{"id":"s","text":"hello"}]}))
   self.assertEqual(out["status"],"unknown"); self.assertNotEqual(out["segments"][0]["features"]["abstract_action_unclear"]["label"],"absent")
  def test_request_objective_present_with_and_without_context_and_caller_values_unchanged(self):
@@ -381,7 +459,7 @@ class CoreTests(unittest.TestCase):
   class BrokenContext(Context):
    def get_config(self,k,d=None):
     return {"primary_provider":"openrouter"}.get(k,d)
-  with patch.object(plugin,"_send",side_effect=RuntimeError("network_error")):
+  with patch.object(plugin,"_send",side_effect=RuntimeError("network_error")), patch.object(plugin,"_post_openrouter",side_effect=RuntimeError("credential_unavailable")):
    out=json.loads(plugin.ProseFeatureTool(BrokenContext())({"segments":[{"id":"x","text":"synthetic"}]}))
   self.assertEqual(out["status"],"unknown")
   self.assertEqual(out["status"],"unknown"); self.assertTrue(all(f["label"]=="unassessed" and f["confidence"] is None and f["raw_label"] is None for f in out["segments"][0]["features"].values()))
@@ -430,7 +508,7 @@ class CoreTests(unittest.TestCase):
   for feature,label in (("japanese_naturalness","translationese"),("abstract_action_unclear","present"),("unnecessary_contrast","present"),("excessive_praise_empathy","present"),("empty_preamble_conclusion","preamble"),("empty_preamble_conclusion","conclusion"),("scope_expression","scope_only")):
    selected=bind({feature:{"label":label,"raw_label":label,"confidence":0.5}})
    self.assertEqual([(item["feature"],item["label"]) for item in selected["review_candidates"]],[(feature,label)])
-  self.assertEqual(core.TAXONOMY_VERSION,"jev-prose-features-1.5")
+  self.assertEqual(core.TAXONOMY_VERSION,"jev-prose-features-1.8")
  def test_review_candidates_unknown_and_protected_only_are_unassessed(self):
   for clean in (core.prepare_input({"segments":[{"id":"x","text":"本文"}]}),core.prepare_input({"segments":[{"id":"protected","text":"`code only`"}]})):
    result=core.unknown_result(clean,"provider_unavailable")
@@ -452,40 +530,99 @@ class CoreTests(unittest.TestCase):
   self.assertEqual(bound["segments"][1]["review_status"],"assessed")
   self.assertEqual(bound["segments"][1]["review_candidates"],[])
   self.assertIsNone(bound["segments"][1]["review_confidence"])
-
- def test_protected_segments_do_not_consume_two_provider_batches(self):
-  protected=[{"id":f"protected-{i}","text":"`code only`"} for i in range(4)]
-  body={"id":"body-0","text":"Readable prose."}
-  calls=[]
-  def fake_send(_ctx,_bridge,request,_timeout):
-   calls.append(request)
-   state=json.loads(request["state"])
-   batch=core.prepare_input({"segments":state["segments"]})
-   fixture=core.build_request(batch,model="offline-fixture")
+ def test_scope_boundary_blurring_is_purpose_focus_shift_axis_with_confidence(self):
+  cases=[
+   {"id":"case-a-shift","text":"まだ具体的な方法が思いつかなくても、困っている場面を言葉にするところから始められます。","purpose":"本人への相談案内の最初の一歩と支援側が一緒にすることを案内"},
+   {"id":"case-b-shift","text":"対応を始めたあとも、本人の困りごとが軽くなったか、続けられる方法かを確かめていくと、実際の仕事に合う配慮を考えやすくなります。","purpose":"職場と本人が実施後に確認し方法を見直す説明"},
+   {"id":"case-c-aligned","text":"まだ具体的な方法が思いつかないときは、まず、どんな場面で困っているのかを一緒に整理していきましょう。","purpose":"本人への相談案内の最初の一歩と支援側が一緒にすることを案内"},
+   {"id":"case-d-aligned","text":"対応を始めたあとも、困りごとが減ったか、無理なく続けられるかを本人と確認し、必要に応じて方法を見直していきます。","purpose":"職場と本人が実施後に確認し方法を見直す説明"},
+   {"id":"case-e-capability","text":"このソフトでは、入力した表をCSV形式で保存できます。","purpose":"ソフトの機能説明"},
+   {"id":"case-f-effect","text":"備品に定位置ラベルを付けると、従業員が目的の備品を見つけやすくなります。","purpose":"具体的対象と主体と条件付き効果説明"},
+  ]
+  clean=core.prepare_input({"segments":[{"id":row["id"],"text":row["text"]} for row in cases],"purpose":"用途に沿って文の焦点を確認","context":"各文に明示した用途を維持する","reader":"各文の用途に応じた読者"})
+  request=core.build_request(clean,model="fixture")
+  self.assertEqual(len(request["questions"]),len(cases)*10)
+  answers={}; expected={
+   "case-a-shift":("present",0.84),"case-b-shift":("present",0.76),
+   "case-c-aligned":("absent",0.91),"case-d-aligned":("absent",0.88),
+   "case-e-capability":("absent",0.95),"case-f-effect":("absent",0.93),
+  }
+  for key,(sid,feature,labels) in request["_question_map"].items():
+   selected,confidence=expected[sid] if feature=="scope_boundary_blurring" else (("absent",0.9) if feature in core.BINARY_REVIEW_AXES else (labels[0],0.9))
+   answers[key]={"choice":selected,"confidence":confidence,"probabilities":{label:(1.0 if label==selected else 0.0) for label in labels}}
+  validated=core.validate_response(clean,request,core.parse_response({"model":"offline-fixture","answers":answers}))
+  result=core.bind_response(clean,validated)
+  observed={row["id"]:(row["features"]["scope_boundary_blurring"]["label"],row["features"]["scope_boundary_blurring"]["confidence"]) for row in result["segments"]}
+  self.assertEqual(observed,expected)
+  self.assertEqual(result["status"],"classified")
+  self.assertTrue(result["advisory_only"])
+  boundary_candidates=[(row["id"],item["feature"]) for row in result["segments"] for item in row["review_candidates"] if item["feature"]=="scope_boundary_blurring"]
+  self.assertEqual(boundary_candidates,[("case-a-shift","scope_boundary_blurring"),("case-b-shift","scope_boundary_blurring")])
+  self.assertTrue(all(item["feature"]!="scope_boundary_blurring" for row in result["segments"] for item in row["review_candidates"] if row["id"] not in {"case-a-shift","case-b-shift"}))
+  boundary_clean=core.prepare_input({"segments":[{"id":"threshold","text":"具体例のない抽象表現です。"}]})
+  for confidence,expected_review in ((0.49,False),(0.5,True),(0.51,True)):
+   focused=core.bind_response(boundary_clean,{"model":"fixture","features":{"threshold":{"scope_boundary_blurring":{"label":"present","raw_label":"present","confidence":confidence}}}})["segments"][0]
+   candidates=[item for item in focused["review_candidates"] if item["feature"]=="scope_boundary_blurring"]
+   self.assertEqual(bool(candidates),expected_review)
+   if candidates: self.assertEqual(candidates[0]["confidence"],confidence)
+  missing=core.bind_response(clean,{"model":"fixture","features":{}})
+  self.assertTrue(all(row["features"]["scope_boundary_blurring"]["label"]=="unassessed" and row["features"]["scope_boundary_blurring"]["confidence"] is None for row in missing["segments"]))
+  key=next(k for k,(_,feature,_) in request["_question_map"].items() if feature=="scope_boundary_blurring")
+  instruction=request["questions"][key]["instructions"]
+  self.assertIn("expected focus",instruction)
+  self.assertIn("Do not invent an expected focus",instruction)
+  self.assertIn("capability or effect",instruction)
+ def test_action_effect_substitution_axis_stays_independent_and_advisory(self):
+  clean=core.prepare_input({"segments":[{"id":"substitution","text":"困っている場面を言葉にすると、本人が始められます。"}] ,"purpose":"本人と支援者が一緒に困りごとを整理する相談の案内"})
+  request=core.build_request(clean,model="fixture")
+  self.assertEqual(core.TAXONOMY_VERSION,"jev-prose-features-1.8")
+  self.assertEqual(len(core.FEATURES),10)
+  self.assertEqual(set(core.FEATURE_CRITERIA["action_effect_substitution"]),{"present","absent"})
+  self.assertIn("action_effect_substitution",core.BINARY_REVIEW_AXES)
+  key=next(k for k,(_,feature,_) in request["_question_map"].items() if feature=="action_effect_substitution")
+  question=request["questions"][key]
+  self.assertIn("capability/effect explanation is itself the purpose",question["instructions"])
+  self.assertIn("A sentence-final できます/しやすくなります",question["instructions"])
+  self.assertIn("independent from scope-boundary shift",question["instructions"])
+  answers={}
+  for q,(_,feature,labels) in request["_question_map"].items():
+   choice="present" if feature=="action_effect_substitution" else ("absent" if "absent" in labels else ("neither" if "neither" in labels else ("none" if "none" in labels else labels[0])))
+   answers[q]={"choice":choice,"confidence":0.9,"probabilities":{label:(1.0 if label==choice else 0.0) for label in labels}}
+  validated=core.validate_response(clean,request,core.parse_response({"model":"fixture","answers":answers}))
+  result=core.bind_response(clean,validated)
+  features=result["segments"][0]["features"]
+  self.assertEqual(features["action_effect_substitution"]["label"],"present")
+  self.assertEqual(features["scope_boundary_blurring"]["label"],"absent")
+  candidates=result["segments"][0]["review_candidates"]
+  self.assertEqual([row["feature"] for row in candidates],["action_effect_substitution"])
+  self.assertEqual(result["segments"][0]["review_status"],"assessed")
+  low=core.bind_response(clean,{"model":"fixture","features":{"substitution":{"action_effect_substitution":{"label":"present","confidence":0.49,"raw_label":"present"}}}})["segments"][0]
+  self.assertFalse(any(row["feature"]=="action_effect_substitution" for row in low["review_candidates"]))
+  unknown=core.unknown_result(clean,"provider_unavailable")["segments"][0]
+  self.assertEqual(unknown["features"]["action_effect_substitution"],{"label":"unassessed","confidence":None,"raw_label":None})
+  self.assertEqual(unknown["review_candidates"],[])
+  registered=Context(); plugin.register(registered)
+  handler=registered.tools["jev_classify_prose_features"]["handler"]
+  def fixture_response(_ctx,_bridge,body,_timeout,_provider_spec=None):
    answers={}
-   for key,(_sid,_feature,labels) in fixture["_question_map"].items():
-    choice=labels[0]
-    answers[key]={"choice":choice,"confidence":0.9,"probabilities":{label:(1.0 if label==choice else 0.0) for label in labels}}
-   return {"model":"offline-fixture","answers":answers}
-  for segments in (protected+[body],[body]+protected):
-   calls.clear()
-   with patch.object(plugin,"_send",side_effect=fake_send):
-    result=json.loads(plugin.ProseFeatureTool(Context())({"segments":segments}))
-   self.assertEqual(result["status"],"classified")
-   self.assertEqual(len(calls),1)
-   self.assertEqual([len(json.loads(call["state"])["segments"]) for call in calls],[1])
-   rows={row["id"]:row for row in result["segments"]}
-   self.assertEqual([row["id"] for row in result["segments"]],[row["id"] for row in segments])
-   self.assertTrue(all(rows[f"protected-{i}"]["features"]["japanese_naturalness"]["label"]=="unassessed" for i in range(4)))
-   self.assertNotEqual(rows["body-0"]["features"]["japanese_naturalness"]["label"],"unassessed")
-
- def test_all_protected_segments_remain_unknown_without_provider_calls(self):
-  segments=[{"id":f"protected-{i}","text":"`code only`"} for i in range(4)]
-  with patch.object(plugin,"_send") as send:
-   result=json.loads(plugin.ProseFeatureTool(Context())({"segments":segments}))
-  self.assertEqual(result["status"],"unknown")
-  self.assertEqual(result["reason"],"no_unprotected_prose")
-  self.assertEqual(len(result["segments"]),4)
-  self.assertTrue(all(row["review_status"]=="unassessed" for row in result["segments"]))
-  self.assertTrue(all(row["features"]["japanese_naturalness"]["label"]=="unassessed" for row in result["segments"]))
-  send.assert_not_called()
+   for key,question in body["questions"].items():
+    criteria=question["criteria"]
+    labels=tuple(criteria)
+    is_target="action_effect_substitution" in key
+    selected=("present" if handler_confidence>=0.5 else "absent") if is_target else ("absent" if "absent" in labels else ("neither" if "neither" in labels else ("none" if "none" in labels else labels[0])))
+    confidence=handler_confidence if is_target else 0.9
+    answers[key]={"choice":selected,"confidence":confidence,"probabilities":{label:(1.0 if label==selected else 0.0) for label in labels}}
+   return {"model":"registered-handler-fixture","answers":answers}
+  for handler_confidence,expected_label in ((0.9,"present"),(0.49,"absent")):
+   with patch.object(plugin,"_send",side_effect=fixture_response):
+    fresh=json.loads(handler({"segments":[{"id":"substitution","text":"困っている場面を言葉にすると、本人が始められます。"}],"purpose":"本人と支援者が一緒に困りごとを整理する相談の案内"}))
+   self.assertEqual(fresh["status"],"classified")
+   self.assertEqual(fresh["segments"][0]["features"]["action_effect_substitution"]["label"],expected_label)
+   self.assertTrue(fresh["advisory_only"])
+   self.assertEqual(bool(any(item["feature"]=="action_effect_substitution" for item in fresh["segments"][0]["review_candidates"])),handler_confidence>=0.5)
+  with patch.object(plugin,"_send",side_effect=RuntimeError("credential_unavailable")):
+   failed=json.loads(handler({"segments":[{"id":"substitution","text":"困っている場面を言葉にすると、本人が始められます。"}],"purpose":"本人と支援者が一緒に困りごとを整理する相談の案内"}))
+  self.assertEqual(failed["status"],"unknown")
+  self.assertEqual(failed["segments"][0]["features"]["action_effect_substitution"]["label"],"unassessed")
+  schema=plugin._schema()["parameters"]["properties"]
+  self.assertEqual(set(schema),{"text","segments","purpose","context","reader"})

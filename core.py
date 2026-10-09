@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, math, re
 from typing import Any, Mapping
 
-TAXONOMY_VERSION = "jev-prose-features-1.5"
+TAXONOMY_VERSION = "jev-prose-features-1.8"
 REVIEW_THRESHOLD = 0.5
 REVIEW_FOCUS = {
  "japanese_naturalness": {"translationese": "直訳調に見える言い回しが、日本語として自然に読めるかを前後の流れと合わせて確認する。", "other_awkward": "言い回しや文のつながりが、前後の流れの中で自然に読めるかを確認する。"},
@@ -13,9 +13,11 @@ REVIEW_FOCUS = {
  "excessive_praise_empathy": "称賛や共感の表現が、読み手にとって自然で過不足ないかを確認する。",
  "empty_preamble_conclusion": {"preamble": "導入が本文への自然な入り口になっているかを確認する。", "conclusion": "結びが前後の流れを自然にまとめているかを確認する。"},
  "scope_expression": "範囲の説明が、読み手の理解に必要か、流れの中で自然かを確認する。",
+ "scope_boundary_blurring": "目的や前後の流れが求める主体・対象・条件・話の焦点と、文の焦点のずれを人が確認する。",
+ "action_effect_substitution": "行動案内で、何をするかが可能性・効果の説明だけにすり替わっていないかを確認する。",
 }
-BINARY_REVIEW_AXES = {"abstract_action_unclear", "redundant_paraphrase", "unnecessary_contrast", "excessive_praise_empathy"}
-FEATURES = ("empty_preamble_conclusion", "abstract_action_unclear", "redundant_paraphrase", "unnecessary_contrast", "excessive_praise_empathy", "japanese_naturalness", "scope_expression", "author_style_impression")
+BINARY_REVIEW_AXES = {"abstract_action_unclear", "redundant_paraphrase", "unnecessary_contrast", "excessive_praise_empathy", "scope_boundary_blurring", "action_effect_substitution"}
+FEATURES = ("empty_preamble_conclusion", "abstract_action_unclear", "redundant_paraphrase", "unnecessary_contrast", "excessive_praise_empathy", "japanese_naturalness", "scope_expression", "scope_boundary_blurring", "action_effect_substitution", "author_style_impression")
 # Keep choice text short; put definitions and exceptions in the axis instruction.
 CATEGORICAL = {
  "empty_preamble_conclusion": ("preamble", "conclusion", "neither"),
@@ -31,6 +33,8 @@ FEATURE_CRITERIA = {
  "excessive_praise_empathy": {"present": "称賛・共感が過剰", "absent": "該当する特徴がない"},
  "japanese_naturalness": {"natural": "日本語として自然に読める", "translationese": "直訳調の言い回しで不自然", "other_awkward": "直訳調以外の言い回しで不自然"},
  "scope_expression": {"none": "該当する範囲限定表現がない", "necessary_scope": "理解や判断に必要な対象・条件を限定", "scope_only": "既知の範囲を言い直し新情報なし"},
+ "scope_boundary_blurring": {"present": "目的・前後の流れが求める主体・対象・条件・焦点からずれる", "absent": "求める焦点からずれていない"},
+ "action_effect_substitution": {"present": "行動案内で何をするかが可能性・効果の説明だけに置き換わる", "absent": "行動説明のすり替わりがない。または可能性・効果の説明が目的"},
  "author_style_impression": {"ai_like": "AIが書いた文に見える。", "human_like": "人間が書いた文に見える。"},
 }
 FEATURE_INSTRUCTIONS = {
@@ -41,11 +45,13 @@ FEATURE_INSTRUCTIONS = {
  "excessive_praise_empathy": "Assess tone in context of purpose and reader. Preserve ordinary courtesy and empathy that help the reader; flag only disproportionate or formulaic wording that gets in the way of comprehension.",
  "japanese_naturalness": "Judge whether wording reads naturally as Japanese beyond intelligibility, in the purpose, intended reader, and surrounding flow. Translationese is genuinely unnatural literal/calque-like wording, including awkward verb–object collocations, action/clause wording awkwardly used as a noun option label, or excessive nominalization, possessive/pronoun use, or literal word order when awkward for purpose and context. other_awkward means unnatural for another wording reason; do not merge ordinary action-clarity issues into either label. Do not infer translation origin, source language, truth, or authorship. Natural action proposals, menu/treatment choices, function names, and quoted technical labels are not translationese merely for using 「〜を選ぶ」. Select the best-supported available substantive option; express ambiguity through the returned confidence and probabilities.",
  "scope_expression": "Judge scope-limiting expressions only in context of purpose, surrounding text, and reader understanding. necessary_scope limits a subject or condition needed for reader understanding or judgment; scope_only restates an already-known scope without adding information. Do not mistake necessary qualifications, conditions, contrasts, or explanations for defects and do not recommend removing them merely because they add no new information. Select the best-supported available substantive option; express ambiguity through the returned confidence and probabilities.",
+ "scope_boundary_blurring": "Use the supplied purpose/context for expected focus and keep this axis independent from general action specificity, naturalness, and restatement of known scope. Mark present when it shifts to a different scope or focus—for example, when a purpose calls for what a person and supporter will do together in consultation but the sentence instead centers only on what the person can do; or when a purpose calls for how workplace accommodations will be checked and revised but the sentence instead centers only on the benefit of checking. These are examples, not forced labels: use only the purpose/context actually supplied. Mark absent when the sentence stays on the requested focus, including a purposeful explanation of a capability or effect. A change from concrete action to possibility/effect, an omitted subject, or wording such as できます/しやすくなります is not sufficient by itself; do not mark present merely for general vagueness, action-detail gaps, unnatural Japanese, or restating known scope. Do not invent an expected focus when purpose/context gives no basis. Without an original concrete sentence, assess only the presented sentence and supplied purpose/context; do not infer a historical replacement, author intent, truth, or translation origin. Return an advisory signal only; do not propose edits or actions. Use confidence and probabilities for ambiguity; do not force present.",
+ "action_effect_substitution": "Use the supplied purpose/context to determine whether the sentence is guiding an action or explaining a capability/effect. Mark present only when an action-guidance purpose calls for what someone should do but the sentence substitutes only a possibility or benefit/effect—for example, a purpose asks to describe jointly organizing a difficulty but the sentence says only that the person can get started, or asks to check and revise an accommodation but the sentence states only that this may make suitable accommodations easier to consider. Mark absent when capability/effect explanation is itself the purpose, or when the requested action remains described. A sentence-final できます/しやすくなります, omitted subject, abstraction, or lack of detail is not sufficient by itself. Use only the supplied purpose/context; do not invent an intended action, actor, original wording, replacement history, author intent, facts, or translation origin. Keep this axis independent from scope-boundary shift, general action specificity, and naturalness. Return an advisory signal only; do not propose edits or actions. Use confidence and probabilities for ambiguity; do not force present.",
  "author_style_impression": "対象文と前後の文から、どちらの文体に見えるかを分類する。これは独立した印象軸であり、他の軸の評価や文章の良し悪しに結び付けない。",
 }
 MAX_TEXT_CHARS, MAX_SEGMENT_CHARS, MAX_SEGMENTS = 12000, 3000, 8
 MAX_INPUT_BYTES, MAX_REQUEST_BYTES, MAX_TIMEOUT_SECONDS = 32000, 40000, 12.0
-EVALUATION_OBJECTIVE = "読者が目的・読者像・前後の流れを踏まえ、日本語の文章として自然に読み進められるかを確認する。文章を短くしたり文を削ったりすること自体を目的にしない。内容・意図・語り口を保ち、読者が引っかかる言い回しやつながりを確認する。事実・内容の正しさ、英語由来か翻訳文かは推定・判定しない。8つの評価軸はそれぞれのcriteriaに従い、すべてを文法・自然さの問題にまとめない。"
+EVALUATION_OBJECTIVE = "読者が目的・読者像・前後の流れを踏まえ、日本語の文章として自然に読み進められるかを確認する。文章を短くしたり文を削ったりすること自体を目的にしない。内容・意図・語り口を保ち、読者が引っかかる言い回しやつながりを確認する。事実・内容の正しさ、英語由来か翻訳文かは推定・判定しない。10個の評価軸はそれぞれのcriteriaに従い、すべてを文法・自然さの問題にまとめない。"
 
 class InputError(ValueError): pass
 

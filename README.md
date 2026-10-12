@@ -1,5 +1,25 @@
 # Jev prose features
 
+## Public quick start
+
+**What it is:** An on-demand Hermes Agent plugin that classifies Japanese prose features as advisory review topics.
+**Who it is for:** Writers and reviewers checking supplied Japanese text in its stated purpose and context.
+**Requirements:** Hermes Agent; no `requires_hermes` range or external Python dependency is declared. Classification uses the configured TypeSafe provider (`TYPESAFE_API_KEY`) and can use OpenRouter (`OPENROUTER_API_KEY`) under the implementation's fallback rules. A tool call sends the supplied text and context to the selected external provider; do not submit private or sensitive text without authorization.
+
+```sh
+hermes plugins install kkwelfare/jev-prose-features --no-enable
+hermes plugins enable jev-prose-features
+```
+
+**Minimal tool input** for `jev_classify_prose_features` (provider-backed; sends the text above):
+
+```json
+{"segments":[{"id":"s1","text":"この設定を保存すると、次回から自動で使えます。"}],"purpose":"設定方法を説明する","context":"初めて使う人向け","reader":"初めて読む人"}
+```
+
+License: [MIT](LICENSE).
+
+
 An on-demand, advisory Hermes plugin for examining how Japanese prose reads to its intended reader in context. Taxonomy `jev-prose-features-1.8` preserves the original nine independent feature axes and adds `action_effect_substitution` as a separate advisory axis. The existing `scope_boundary_blurring` remains a mismatch between actor, object, conditions, or focus expected by the stated purpose/context and the sentence's focus. The new axis checks only whether an action-guidance purpose has been replaced by a possibility/benefit/effect statement; capability/effect explanations remain absent when that is the purpose. Neither abstract wording nor 「できます／しやすくなります」 alone is a mismatch; both axes require evidence in supplied purpose/context. It returns source-bound labels, confidence, and small contextual review topics; it does not judge factual correctness or infer translation/authorship.
 
 ## Behavior and boundaries
